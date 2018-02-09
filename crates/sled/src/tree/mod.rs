@@ -30,12 +30,19 @@ impl<'a> IntoIterator for &'a Tree {
     }
 }
 
+/// A merge operator allows data to be combined at read-time.
+pub type MergeOperator = fn(key: &Key,
+                            last_value: Option<&Value>,
+                            new_merge: &Value)
+                            -> Option<Value>;
+
 /// A flash-sympathetic persistent lock-free B+ tree
 #[derive(Clone)]
 pub struct Tree {
     pages: Arc<PageCache<BLinkMaterializer, Frag, Vec<(PageID, PageID)>>>,
     config: Config,
     root: Arc<AtomicUsize>,
+    merge_operator: Option<MergeOperator>,
 }
 
 unsafe impl Send for Tree {}
@@ -44,6 +51,21 @@ unsafe impl Sync for Tree {}
 impl Tree {
     /// Load existing or create a new `Tree`.
     pub fn start(config: Config) -> DbResult<Tree, ()> {
+        Tree::_start(config, None)
+    }
+
+    /// Load existing or create a new `Tree` with a merge operator.
+    pub fn start_with_merge_operator(
+        config: Config,
+        merge_operator: MergeOperator,
+    ) -> DbResult<Tree, ()> {
+        Tree::_start(config, Some(merge_operator))
+    }
+
+    fn _start(
+        config: Config,
+        merge_operator: Option<MergeOperator>,
+    ) -> DbResult<Tree, ()> {
         #[cfg(feature = "check_snapshot_integrity")]
         config.verify_snapshot::<BLinkMaterializer, Frag, Vec<(PageID, PageID)>>();
 
@@ -130,6 +152,7 @@ impl Tree {
             pages: Arc::new(pages),
             config: config,
             root: Arc::new(AtomicUsize::new(root_id)),
+            merge_operator: merge_operator,
         })
     }
 
@@ -230,7 +253,39 @@ impl Tree {
                 &guard,
             )
             {
-                last_node.apply(&frag);
+                last_node.apply(&frag, self.merge_operator);
+                let should_split = last_node.should_split(self.fanout());
+                path.push((last_node.clone(), new_cas_key));
+                // success
+                if should_split {
+                    self.recursive_split(&path, &guard)?;
+                }
+                return Ok(());
+            }
+            M.tree_looped();
+        }
+    }
+
+    /// Merge a new value into the total state for a key.
+    pub fn merge(&self, key: Key, value: Value) -> DbResult<(), ()> {
+        if self.config.get_read_only() {
+            return Err(Error::Unsupported(
+                "the database is in read-only mode".to_owned(),
+            ));
+        }
+        let frag = Frag::Merge(key.clone(), value);
+        let guard = pin();
+        loop {
+            let mut path = self.path_for_key(&*key, &guard)?;
+            let (mut last_node, last_cas_key) = path.pop().unwrap();
+            if let Ok(new_cas_key) = self.pages.link(
+                last_node.id,
+                last_cas_key,
+                frag.clone(),
+                &guard,
+            )
+            {
+                last_node.apply(&frag, self.merge_operator);
                 let should_split = last_node.should_split(self.fanout());
                 path.push((last_node.clone(), new_cas_key));
                 // success
@@ -408,7 +463,10 @@ impl Tree {
                     );
 
                     if let Ok(res) = res {
-                        parent_node.apply(&Frag::ParentSplit(parent_split));
+                        parent_node.apply(
+                            &Frag::ParentSplit(parent_split),
+                            self.merge_operator,
+                        );
                         *parent_cas_key = res;
                     } else {
                         continue;

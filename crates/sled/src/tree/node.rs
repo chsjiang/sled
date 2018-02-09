@@ -10,16 +10,16 @@ pub struct Node {
 }
 
 impl Node {
-    pub fn apply(&mut self, frag: &Frag) {
+    pub fn apply(&mut self, frag: &Frag, merge_fn: Option<MergeOperator>) {
         use self::Frag::*;
 
         match *frag {
             Set(ref k, ref v) => {
-                if Bound::Inc(k.clone()) < self.hi {
-                    self.set_leaf(k.clone(), v.clone());
-                } else {
-                    panic!("tried to consolidate set at key <= hi")
-                }
+                assert!(
+                    Bound::Inc(k.clone()) < self.hi,
+                    "tried to consolidate set at key <= hi"
+                );
+                self.set_leaf(k.clone(), v.clone());
             }
             ChildSplit(ref child_split) => {
                 self.child_split(child_split);
@@ -28,11 +28,24 @@ impl Node {
                 self.parent_split(parent_split);
             }
             Del(ref k) => {
-                if Bound::Inc(k.clone()) < self.hi {
-                    self.del_leaf(k);
-                } else {
-                    panic!("tried to consolidate del at key <= hi")
-                }
+                assert!(
+                    Bound::Inc(k.clone()) < self.hi,
+                    "tried to consolidate del at key <= hi"
+                );
+                self.del_leaf(k);
+            }
+            Merge(ref k, ref v) => {
+                assert!(
+                    Bound::Inc(k.clone()) < self.hi,
+                    "tried to consolidate merge at key <= hi"
+                );
+                self.merge_leaf(
+                    k.clone(),
+                    v.clone(),
+                    merge_fn.expect(
+                        "must have set a merge operator before merging pages",
+                    ),
+                );
             }
             Base(_, _) => panic!("encountered base page in middle of chain"),
         }
@@ -51,6 +64,35 @@ impl Node {
             }
         } else {
             panic!("tried to Set a value to an index");
+        }
+    }
+
+    pub fn merge_leaf(
+        &mut self,
+        key: Key,
+        val: Value,
+        merge_fn: MergeOperator,
+    ) {
+        if let Data::Leaf(ref mut records) = self.data {
+            let search =
+                records.binary_search_by(|&(ref k, ref _v)| (**k).cmp(&*key));
+            if let Ok(idx) = search {
+                let new = merge_fn(&key, Some(&records[idx].1), &val);
+                if let Some(new) = new {
+                    records.push((key, new));
+                    records.swap_remove(idx);
+                } else {
+                    records.remove(idx);
+                }
+            } else {
+                let new = merge_fn(&key, None, &val);
+                if let Some(new) = new {
+                    records.push((key, new));
+                    records.sort();
+                }
+            }
+        } else {
+            panic!("tried to merge a value to an index");
         }
     }
 

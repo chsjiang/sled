@@ -21,8 +21,8 @@ impl Materializer for BLinkMaterializer {
     }
 
     fn merge(&self, frags: &[&Frag]) -> Frag {
-        let (mut base_node, is_root) = match frags[0].clone() {
-            Frag::Base(base_node, is_root) => (base_node, is_root),
+        let (mut base_node, is_root) = match *frags[0] {
+            Frag::Base(base_node, is_root) => (base_node.clone(), is_root),
             _ => panic!("non-Base in first element of frags slice"),
         };
 
